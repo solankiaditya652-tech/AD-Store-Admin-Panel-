@@ -1,0 +1,1089 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+<title>AD Store — Admin Panel</title>
+<script src="https://cdn.tailwindcss.com"></script>
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.0/css/all.min.css"/>
+<link href="https://fonts.googleapis.com/css2?family=Syne:wght@400;500;600;700;800&family=Inter:wght@300;400;500;600&display=swap" rel="stylesheet"/>
+
+<script type="module">
+  // ============================================================
+  // FIREBASE CONFIG — Replace with your Firebase project config
+  // ============================================================
+  import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-app.js";
+  import {
+    getAuth, onAuthStateChanged,
+    signInWithEmailAndPassword, signOut
+  } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-auth.js";
+  import {
+    getFirestore, collection, doc, getDoc, getDocs, setDoc,
+    updateDoc, deleteDoc, query, where, orderBy, serverTimestamp, onSnapshot
+  } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore.js";
+
+  const firebaseConfig = {
+    apiKey: "AIzaSyB1T3dfytScHbCExSWQSj55wOCYo4LH6RE",
+    authDomain: "ad-store-4029b.firebaseapp.com",
+    databaseURL: "https://ad-store-4029b-default-rtdb.asia-southeast1.firebasedatabase.app",
+    projectId: "ad-store-4029b",
+    storageBucket: "ad-store-4029b.firebasestorage.app",
+    messagingSenderId: "541345400233",
+    appId: "1:541345400233:web:02bcc000031c199038f0b8"
+  };
+
+  const app = initializeApp(firebaseConfig);
+  const auth = getAuth(app);
+  const db   = getFirestore(app);
+
+  // ============================================================
+  // STATE
+  // ============================================================
+  let currentUser  = null;
+  let currentRole  = null;
+  let allApps      = [];
+  let pendingApps  = [];
+  let approvedApps = [];
+  let activeSection = 'dashboard';
+  let unsubApps    = null;
+
+  // ============================================================
+  // UTILS
+  // ============================================================
+  function showToast(msg, type = 'success') {
+    const t = document.getElementById('toast');
+    t.textContent = msg;
+    const base = 'fixed top-5 right-5 z-[9999] px-5 py-3 rounded-xl text-sm font-semibold shadow-2xl transition-all duration-300 flex items-center gap-2';
+    const colors = {
+      success : 'bg-emerald-500 text-white',
+      error   : 'bg-red-500 text-white',
+      info    : 'bg-blue-500 text-white',
+      warning : 'bg-amber-500 text-slate-900'
+    };
+    t.className = `${base} ${colors[type] || colors.success}`;
+    t.style.opacity = '1'; t.style.transform = 'translateX(0)';
+    setTimeout(() => { t.style.opacity = '0'; t.style.transform = 'translateX(20px)'; }, 3500);
+  }
+
+  function timeAgo(ts) {
+    if (!ts) return '—';
+    const d = ts.toDate ? ts.toDate() : new Date(ts);
+    const diff = Date.now() - d.getTime();
+    const m = Math.floor(diff / 60000);
+    if (m < 1)  return 'Just now';
+    if (m < 60) return `${m}m ago`;
+    const h = Math.floor(m / 60);
+    if (h < 24) return `${h}h ago`;
+    const days = Math.floor(h / 24);
+    if (days < 30) return `${days}d ago`;
+    return d.toLocaleDateString();
+  }
+
+  function getInitials(name = '') {
+    return name.split(' ').map(w => w[0]).join('').toUpperCase().slice(0, 2) || 'AD';
+  }
+
+  function formatNum(n) {
+    if (n >= 1000) return (n / 1000).toFixed(1) + 'K';
+    return String(n);
+  }
+
+  function setLoading(show) {
+    // Only allow hiding the loader, never re-show it after page has loaded
+    if (!show) {
+      const el = document.getElementById('page-loading');
+      if (el) el.style.display = 'none';
+    }
+  }
+
+  // ============================================================
+  // AUTH
+  // ============================================================
+  async function doLogin(email, pass) {
+    try {
+      document.getElementById('login-btn').disabled = true;
+      document.getElementById('login-btn').innerHTML = '<i class="fas fa-spinner fa-spin mr-2"></i>Signing in...';
+      await signInWithEmailAndPassword(auth, email, pass);
+    } catch(e) {
+      showToast(e.message, 'error');
+      document.getElementById('login-btn').disabled = false;
+      document.getElementById('login-btn').innerHTML = '<i class="fas fa-sign-in-alt mr-2"></i>Sign In';
+    }
+  }
+  window.doLogin = doLogin;
+
+  async function doLogout() {
+    if (unsubApps) unsubApps();
+    await signOut(auth);
+  }
+  window.doLogout = doLogout;
+
+  // ============================================================
+  // ADMIN SELF-SETUP
+  // ============================================================
+  async function setupAdmin() {
+    if (!currentUser) return;
+    try {
+      const btn = document.getElementById('setup-admin-btn');
+      btn.disabled = true;
+      btn.innerHTML = '<i class="fas fa-spinner fa-spin mr-2"></i>Setting up...';
+      await setDoc(doc(db, 'users', currentUser.uid), {
+        uid       : currentUser.uid,
+        name      : currentUser.displayName || 'Admin',
+        email     : currentUser.email,
+        role      : 'admin',
+        createdAt : serverTimestamp()
+      }, { merge: true });
+      showToast('Admin access granted! Reloading...', 'success');
+      setTimeout(() => location.reload(), 1500);
+    } catch(e) {
+      showToast('Setup failed: ' + e.message, 'error');
+    }
+  }
+  window.setupAdmin = setupAdmin;
+
+  // ============================================================
+  // FIRESTORE LISTENER
+  // ============================================================
+  function listenApps() {
+    unsubApps = onSnapshot(collection(db, 'apps'), snap => {
+      allApps      = snap.docs.map(d => ({ id: d.id, ...d.data() }));
+      pendingApps  = allApps.filter(a => a.status === 'pending');
+      approvedApps = allApps.filter(a => a.status === 'approved');
+      updateStats();
+      if (activeSection === 'dashboard') renderDashboard();
+      if (activeSection === 'review')    renderReview();
+      if (activeSection === 'manage')    renderManage();
+    }, err => { showToast('Listener error: ' + err.message, 'error'); });
+  }
+
+  // ============================================================
+  // APP ACTIONS
+  // ============================================================
+  async function approveApp(appId) {
+    try {
+      await updateDoc(doc(db, 'apps', appId), { status: 'approved' });
+      showToast('App approved ✅', 'success');
+    } catch(e) { showToast(e.message, 'error'); }
+  }
+  window.approveApp = approveApp;
+
+  async function rejectApp(appId) {
+    try {
+      await updateDoc(doc(db, 'apps', appId), { status: 'rejected' });
+      showToast('App rejected ❌', 'warning');
+    } catch(e) { showToast(e.message, 'error'); }
+  }
+  window.rejectApp = rejectApp;
+
+  async function deleteApp(appId, appName) {
+    if (!confirm(`Delete "${appName}"? This cannot be undone.`)) return;
+    try {
+      await deleteDoc(doc(db, 'apps', appId));
+      showToast(`"${appName}" deleted`, 'info');
+    } catch(e) { showToast(e.message, 'error'); }
+  }
+  window.deleteApp = deleteApp;
+
+  // ============================================================
+  // STATS
+  // ============================================================
+  function updateStats() {
+    const set = (id, val) => { const el = document.getElementById(id); if(el) el.textContent = val; };
+    set('stat-total',    allApps.length);
+    set('stat-pending',  pendingApps.length);
+    set('stat-approved', approvedApps.length);
+    set('stat-rejected', allApps.filter(a => a.status === 'rejected').length);
+
+    // Badge on sidebar
+    const badge = document.getElementById('pending-badge');
+    if (badge) {
+      badge.textContent  = pendingApps.length;
+      badge.style.display = pendingApps.length ? 'flex' : 'none';
+    }
+  }
+
+  // ============================================================
+  // SECTION SWITCH
+  // ============================================================
+  function switchSection(sec) {
+    activeSection = sec;
+    ['dashboard','review','manage','users'].forEach(s => {
+      document.getElementById(`nav-${s}`)?.classList.toggle('nav-active', s === sec);
+      document.getElementById(`section-${s}`)?.classList.toggle('hidden', s !== sec);
+    });
+    if (sec === 'dashboard') renderDashboard();
+    if (sec === 'review')    renderReview();
+    if (sec === 'manage')    renderManage();
+    // Close mobile sidebar
+    document.getElementById('sidebar').classList.remove('sidebar-open');
+  }
+  window.switchSection = switchSection;
+
+  // ============================================================
+  // RENDER: DASHBOARD
+  // ============================================================
+  function renderDashboard() {
+    const el = document.getElementById('recent-activity');
+    if (!el) return;
+    const recent = [...allApps]
+      .sort((a,b) => (b.createdAt?.seconds||0) - (a.createdAt?.seconds||0))
+      .slice(0, 8);
+
+    el.innerHTML = recent.length ? recent.map(a => `
+      <div class="activity-row">
+        <img src="${a.icon || 'https://placehold.co/40x40/1e293b/64748b?text=' + encodeURIComponent((a.name||'A')[0])}"
+          class="activity-icon" alt=""
+          onerror="this.src='https://placehold.co/40x40/1e293b/64748b?text=${encodeURIComponent((a.name||'A')[0])}'"/>
+        <div class="activity-info">
+          <p class="activity-name">${a.name || 'Untitled'}</p>
+          <p class="activity-meta">${a.developerName || 'Unknown Dev'} · ${timeAgo(a.createdAt)}</p>
+        </div>
+        <span class="status-badge status-${a.status}">${a.status}</span>
+      </div>`).join('')
+    : '<div class="empty-msg"><i class="fas fa-inbox"></i><p>No apps yet</p></div>';
+  }
+
+  // ============================================================
+  // RENDER: REVIEW QUEUE
+  // ============================================================
+  function renderReview() {
+    const el = document.getElementById('review-list');
+    if (!el) return;
+    el.innerHTML = pendingApps.length ? pendingApps.map(a => `
+      <div class="review-card" id="rcard-${a.id}">
+        <div class="review-card-header">
+          <img src="${a.icon || 'https://placehold.co/56x56/1e293b/475569?text=' + encodeURIComponent((a.name||'A')[0])}"
+            class="review-icon" alt=""
+            onerror="this.src='https://placehold.co/56x56/1e293b/475569?text=${encodeURIComponent((a.name||'A')[0])}'"/>
+          <div class="review-meta">
+            <h3>${a.name || 'Untitled App'}</h3>
+            <p><i class="fas fa-user mr-1"></i>${a.developerName || 'Unknown'}</p>
+            <p><i class="fas fa-tag mr-1"></i>${a.category || '—'} &nbsp;·&nbsp; <i class="fas fa-code-branch mr-1"></i>v${a.version || '1.0'}</p>
+            <p><i class="fas fa-clock mr-1"></i>${timeAgo(a.createdAt)}</p>
+          </div>
+          <span class="status-badge status-pending ml-auto self-start">Pending</span>
+        </div>
+        ${a.description ? `<p class="review-desc">${a.description}</p>` : ''}
+        ${a.screenshots?.length ? `
+        <div class="review-ss-row">
+          ${a.screenshots.slice(0,3).map(s => `<img src="${s}" class="review-ss" alt="" onerror="this.style.display='none'"/>`).join('')}
+        </div>` : ''}
+        ${a.apkUrl ? `<a href="${a.apkUrl}" target="_blank" class="apk-link"><i class="fas fa-download mr-2"></i>Download APK to Review</a>` : ''}
+        <div class="review-actions">
+          <button class="btn-approve" onclick="window.approveApp('${a.id}')">
+            <i class="fas fa-check mr-2"></i>Approve
+          </button>
+          <button class="btn-reject" onclick="window.rejectApp('${a.id}')">
+            <i class="fas fa-times mr-2"></i>Reject
+          </button>
+        </div>
+      </div>`).join('')
+    : `<div class="empty-msg"><i class="fas fa-check-circle" style="color:#10b981"></i><p>All caught up! No pending apps.</p></div>`;
+  }
+
+  // ============================================================
+  // RENDER: MANAGE (Approved Apps)
+  // ============================================================
+  function renderManage() {
+    const el = document.getElementById('manage-list');
+    if (!el) return;
+    el.innerHTML = approvedApps.length ? `
+      <div class="manage-table-wrap">
+        <table class="manage-table">
+          <thead>
+            <tr>
+              <th>App</th>
+              <th class="hide-sm">Developer</th>
+              <th class="hide-sm">Category</th>
+              <th class="hide-sm">Version</th>
+              <th class="hide-sm">Date</th>
+              <th>Action</th>
+            </tr>
+          </thead>
+          <tbody>
+            ${approvedApps.map(a => `
+            <tr class="table-row">
+              <td>
+                <div class="table-app-cell">
+                  <img src="${a.icon || 'https://placehold.co/36x36/1e293b/475569?text=' + encodeURIComponent((a.name||'A')[0])}"
+                    class="table-icon" alt=""
+                    onerror="this.src='https://placehold.co/36x36/1e293b/475569?text=${encodeURIComponent((a.name||'A')[0])}'"/>
+                  <span class="table-app-name">${a.name || '—'}</span>
+                </div>
+              </td>
+              <td class="hide-sm table-secondary">${a.developerName || '—'}</td>
+              <td class="hide-sm"><span class="cat-chip">${a.category || '—'}</span></td>
+              <td class="hide-sm table-secondary">v${a.version || '1.0'}</td>
+              <td class="hide-sm table-secondary">${timeAgo(a.createdAt)}</td>
+              <td>
+                <button class="btn-delete-sm" onclick="window.deleteApp('${a.id}','${(a.name||'App').replace(/'/g,"\\'")}')">
+                  <i class="fas fa-trash-alt mr-1"></i>Delete
+                </button>
+              </td>
+            </tr>`).join('')}
+          </tbody>
+        </table>
+      </div>`
+    : `<div class="empty-msg"><i class="fas fa-box-open"></i><p>No approved apps yet</p></div>`;
+  }
+
+  // ============================================================
+  // AUTH STATE
+  // ============================================================
+  onAuthStateChanged(auth, async user => {
+    currentUser = user;
+
+    if (!user) {
+      showPage('login');
+      return;
+    }
+
+    // Check role in Firestore
+    try {
+      const snap = await getDoc(doc(db, 'users', user.uid));
+      currentRole = snap.exists() ? snap.data().role : null;
+    } catch(e) {
+      currentRole = null;
+    }
+
+    if (currentRole === 'admin') {
+      const el_name   = document.getElementById('admin-name');
+      const el_email  = document.getElementById('admin-email');
+      const el_avatar = document.getElementById('admin-avatar');
+      if (el_name)   el_name.textContent   = user.displayName || user.email;
+      if (el_email)  el_email.textContent  = user.email;
+      if (el_avatar) el_avatar.textContent = getInitials(user.displayName || user.email);
+      showPage('panel');
+      listenApps();
+      switchSection('dashboard');
+    } else {
+      const el_denied = document.getElementById('denied-email');
+      if (el_denied) el_denied.textContent = user.email;
+      showPage('denied');
+    }
+  });
+
+  function showPage(page) {
+    ['login','panel','denied'].forEach(p => {
+      const el = document.getElementById('page-' + p);
+      if (!el) return;
+      if (p === page) {
+        el.classList.remove('hidden');
+        el.style.display = (p === 'panel') ? 'flex' : 'block';
+        el.style.visibility = 'visible';
+      } else {
+        el.classList.add('hidden');
+        el.style.display = 'none';
+      }
+    });
+    // Hide loading screen permanently
+    const loader = document.getElementById('page-loading');
+    if (loader) {
+      loader.style.display = 'none';
+      loader.classList.add('hidden');
+    }
+  }
+  window.__adminShowPage = showPage;
+
+  // ============================================================
+  // SIDEBAR TOGGLE (Mobile)
+  // ============================================================
+  window.toggleSidebar = function() {
+    document.getElementById('sidebar').classList.toggle('sidebar-open');
+  };
+
+  // Login form
+  window.handleLogin = function() {
+    const email = document.getElementById('l-email').value.trim();
+    const pass  = document.getElementById('l-pass').value;
+    if (!email || !pass) { showToast('Fill all fields', 'error'); return; }
+    doLogin(email, pass);
+  };
+
+  // Enter key on login
+  document.addEventListener('keydown', e => {
+    if (e.key === 'Enter' && !document.getElementById('page-login').classList.contains('hidden')) {
+      window.handleLogin();
+    }
+  });
+</script>
+
+<style>
+  :root {
+    --bg-base   : #080c14;
+    --bg-panel  : #0d1117;
+    --bg-card   : #111827;
+    --bg-card2  : #161d2c;
+    --border    : rgba(255,255,255,0.07);
+    --border2   : rgba(255,255,255,0.04);
+    --text-1    : #f1f5f9;
+    --text-2    : #94a3b8;
+    --text-3    : #475569;
+    --accent    : #38bdf8;
+    --accent-g  : linear-gradient(135deg,#0ea5e9,#6366f1);
+    --success   : #10b981;
+    --warning   : #f59e0b;
+    --danger    : #ef4444;
+    --sidebar-w : 240px;
+  }
+
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+
+  body {
+    font-family: 'Inter', sans-serif;
+    background: var(--bg-base);
+    color: var(--text-1);
+    min-height: 100vh;
+    overflow-x: hidden;
+  }
+
+  h1,h2,h3,h4,h5 { font-family: 'Syne', sans-serif; }
+
+  /* ============ LOADING ============ */
+  #page-loading {
+    position: fixed; inset: 0; z-index: 9999;
+    background: var(--bg-base);
+    display: flex; align-items: center; justify-content: center;
+    flex-direction: column; gap: 20px;
+  }
+  #page-loading.hidden { display: none !important; }
+  .load-logo { font-family: 'Syne',sans-serif; font-size: 28px; font-weight: 800;
+    background: var(--accent-g); -webkit-background-clip:text; -webkit-text-fill-color:transparent; }
+  .spinner {
+    width: 40px; height: 40px; border-radius: 50%;
+    border: 3px solid rgba(255,255,255,0.08);
+    border-top-color: #38bdf8;
+    animation: spin 0.8s linear infinite;
+  }
+  @keyframes spin { to { transform:rotate(360deg); } }
+
+  /* ============ LOGIN PAGE ============ */
+  #page-login {
+    min-height: 100vh; display: flex; align-items: center; justify-content: center;
+    background: radial-gradient(ellipse 80% 80% at 50% -20%, rgba(14,165,233,0.12), transparent),
+                var(--bg-base);
+    padding: 20px;
+  }
+  .login-box {
+    width: 100%; max-width: 420px;
+    background: var(--bg-card); border: 1px solid var(--border);
+    border-radius: 24px; padding: 40px 32px;
+    box-shadow: 0 32px 80px rgba(0,0,0,0.6);
+    animation: fadeUp 0.5s ease;
+  }
+  @keyframes fadeUp { from { opacity:0; transform:translateY(20px); } to { opacity:1; transform:translateY(0); } }
+  .login-brand {
+    display: flex; align-items: center; gap: 12px; margin-bottom: 32px;
+  }
+  .login-brand-icon {
+    width: 48px; height: 48px; border-radius: 14px;
+    background: var(--accent-g);
+    display: flex; align-items: center; justify-content: center;
+    font-size: 20px; color: #fff;
+  }
+  .login-brand-text h1 { font-size: 20px; font-weight: 800; }
+  .login-brand-text p  { font-size: 12px; color: var(--text-2); }
+  .login-label { font-size: 12px; font-weight: 600; color: var(--text-2); margin-bottom: 6px; letter-spacing: 0.5px; text-transform: uppercase; }
+  .login-input {
+    width: 100%; background: rgba(255,255,255,0.04);
+    border: 1px solid var(--border); border-radius: 12px;
+    padding: 12px 16px; color: var(--text-1);
+    font-family: 'Inter',sans-serif; font-size: 14px; outline: none;
+    transition: border-color 0.2s, background 0.2s;
+    margin-bottom: 16px;
+  }
+  .login-input:focus { border-color: rgba(56,189,248,0.5); background: rgba(255,255,255,0.06); }
+  .login-input::placeholder { color: var(--text-3); }
+  #login-btn {
+    width: 100%; padding: 14px;
+    background: var(--accent-g); color: #fff;
+    border: none; border-radius: 12px;
+    font-family: 'Syne',sans-serif; font-size: 15px; font-weight: 700;
+    cursor: pointer; transition: opacity 0.2s; margin-top: 4px;
+  }
+  #login-btn:hover { opacity: 0.9; }
+  #login-btn:disabled { opacity: 0.6; cursor: not-allowed; }
+
+  /* ============ ACCESS DENIED ============ */
+  #page-denied {
+    min-height: 100vh; display: flex; align-items: center; justify-content: center;
+    background: radial-gradient(ellipse at 50% 0%, rgba(239,68,68,0.1), transparent 60%),
+                var(--bg-base);
+    padding: 20px;
+  }
+  .denied-box {
+    width: 100%; max-width: 440px; text-align: center;
+    background: var(--bg-card); border: 1px solid rgba(239,68,68,0.2);
+    border-radius: 24px; padding: 48px 32px;
+    box-shadow: 0 32px 80px rgba(0,0,0,0.6);
+    animation: fadeUp 0.5s ease;
+  }
+  .denied-icon { font-size: 56px; color: var(--danger); margin-bottom: 20px; }
+  .denied-box h2 { font-size: 26px; font-weight: 800; margin-bottom: 10px; }
+  .denied-box p  { color: var(--text-2); font-size: 14px; margin-bottom: 8px; }
+  .denied-email  { color: var(--accent); font-weight: 600; }
+  .denied-divider { border:none; border-top: 1px solid var(--border); margin: 28px 0; }
+  .denied-setup-label { font-size: 12px; color: var(--text-3); margin-bottom: 12px; }
+  #setup-admin-btn {
+    width: 100%; padding: 13px;
+    background: rgba(56,189,248,0.1); color: var(--accent);
+    border: 1px solid rgba(56,189,248,0.25); border-radius: 12px;
+    font-family: 'Syne',sans-serif; font-size: 14px; font-weight: 700;
+    cursor: pointer; transition: background 0.2s; margin-bottom: 12px;
+  }
+  #setup-admin-btn:hover { background: rgba(56,189,248,0.18); }
+  .denied-logout {
+    font-size: 13px; color: var(--text-3); cursor: pointer;
+    background: none; border: none; font-family: 'Inter',sans-serif;
+    text-decoration: underline; margin-top: 4px;
+  }
+
+  /* ============ PANEL LAYOUT ============ */
+  #page-panel { display: flex; min-height: 100vh; }
+
+  /* SIDEBAR */
+  #sidebar {
+    width: var(--sidebar-w); background: var(--bg-panel);
+    border-right: 1px solid var(--border);
+    display: flex; flex-direction: column;
+    position: fixed; top: 0; left: 0; bottom: 0; z-index: 200;
+    transform: translateX(-100%); transition: transform 0.3s ease;
+  }
+  @media (min-width: 900px) {
+    #sidebar { transform: translateX(0) !important; }
+    .main-wrap { margin-left: var(--sidebar-w) !important; }
+    #topbar-menu-btn { display: none !important; }
+    #sidebar-overlay { display: none !important; }
+  }
+  #sidebar.sidebar-open { transform: translateX(0); }
+  #sidebar-overlay {
+    display: none; position: fixed; inset: 0; z-index: 199;
+    background: rgba(0,0,0,0.5); backdrop-filter: blur(2px);
+  }
+  #sidebar.sidebar-open ~ #sidebar-overlay { display: block; }
+
+  .sidebar-brand {
+    padding: 24px 20px 20px;
+    border-bottom: 1px solid var(--border2);
+  }
+  .sidebar-brand-row { display: flex; align-items: center; gap: 10px; }
+  .sidebar-brand-icon {
+    width: 36px; height: 36px; border-radius: 10px;
+    background: var(--accent-g);
+    display: flex; align-items: center; justify-content: center;
+    font-size: 15px; color: #fff; flex-shrink: 0;
+  }
+  .sidebar-brand-name { font-family: 'Syne',sans-serif; font-size: 17px; font-weight: 800; }
+  .sidebar-brand-sub  { font-size: 10px; color: var(--text-3); font-weight: 600; letter-spacing: 1px; text-transform: uppercase; margin-top: 2px; }
+
+  .sidebar-nav { flex: 1; padding: 12px 12px; display: flex; flex-direction: column; gap: 2px; }
+  .nav-item {
+    display: flex; align-items: center; gap: 12px;
+    padding: 11px 14px; border-radius: 12px;
+    cursor: pointer; color: var(--text-2); font-size: 14px; font-weight: 500;
+    transition: all 0.2s; position: relative;
+    border: 1px solid transparent;
+  }
+  .nav-item:hover { background: rgba(255,255,255,0.04); color: var(--text-1); }
+  .nav-item.nav-active {
+    background: rgba(56,189,248,0.1); color: var(--accent);
+    border-color: rgba(56,189,248,0.15);
+  }
+  .nav-item i { width: 18px; text-align: center; font-size: 14px; }
+  .nav-section-label {
+    font-size: 10px; font-weight: 700; letter-spacing: 1.2px;
+    text-transform: uppercase; color: var(--text-3);
+    padding: 12px 14px 4px;
+  }
+  #pending-badge {
+    display: none; align-items: center; justify-content: center;
+    background: var(--danger); color: #fff; font-size: 10px; font-weight: 800;
+    width: 20px; height: 20px; border-radius: 50%; margin-left: auto;
+  }
+
+  .sidebar-user {
+    padding: 16px; border-top: 1px solid var(--border2);
+    display: flex; align-items: center; gap: 10px;
+  }
+  #admin-avatar {
+    width: 36px; height: 36px; border-radius: 50%;
+    background: var(--accent-g); display: flex; align-items: center; justify-content: center;
+    font-family: 'Syne',sans-serif; font-size: 13px; font-weight: 800;
+    flex-shrink: 0; color: #fff;
+  }
+  .sidebar-user-info { flex: 1; min-width: 0; }
+  #admin-name  { font-size: 13px; font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  #admin-email { font-size: 11px; color: var(--text-3); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .logout-icon-btn {
+    background: none; border: none; cursor: pointer;
+    color: var(--text-3); font-size: 14px; padding: 4px;
+    transition: color 0.2s;
+  }
+  .logout-icon-btn:hover { color: var(--danger); }
+
+  /* MAIN WRAP */
+  .main-wrap {
+    flex: 1; display: flex; flex-direction: column;
+    margin-left: 0; transition: margin-left 0.3s;
+    min-width: 0;
+  }
+
+  /* TOPBAR */
+  .topbar {
+    background: rgba(13,17,23,0.9); backdrop-filter: blur(16px);
+    border-bottom: 1px solid var(--border);
+    padding: 16px 24px; display: flex; align-items: center; gap: 16px;
+    position: sticky; top: 0; z-index: 100;
+  }
+  #topbar-menu-btn {
+    background: none; border: none; color: var(--text-2);
+    font-size: 18px; cursor: pointer; padding: 4px;
+    display: flex; align-items: center;
+  }
+  .topbar-title { font-family: 'Syne',sans-serif; font-size: 18px; font-weight: 800; }
+  .topbar-right { margin-left: auto; display: flex; align-items: center; gap: 12px; }
+  .topbar-badge {
+    background: rgba(239,68,68,0.15); color: #ef4444;
+    border: 1px solid rgba(239,68,68,0.25); border-radius: 20px;
+    font-size: 12px; font-weight: 700; padding: 5px 12px;
+    display: flex; align-items: center; gap: 6px;
+  }
+  .topbar-badge.hidden { display: none; }
+
+  /* CONTENT AREA */
+  .content { padding: 28px 24px; flex: 1; max-width: 1200px; }
+
+  /* ============ STAT CARDS ============ */
+  .stats-grid {
+    display: grid; grid-template-columns: repeat(2, 1fr); gap: 16px; margin-bottom: 28px;
+  }
+  @media(min-width:640px) { .stats-grid { grid-template-columns: repeat(4, 1fr); } }
+  .stat-card {
+    background: var(--bg-card); border: 1px solid var(--border);
+    border-radius: 16px; padding: 20px;
+    display: flex; flex-direction: column; gap: 12px;
+    position: relative; overflow: hidden;
+    transition: border-color 0.2s, transform 0.2s;
+  }
+  .stat-card:hover { border-color: rgba(255,255,255,0.12); transform: translateY(-2px); }
+  .stat-card::before {
+    content: ''; position: absolute; top: 0; left: 0; right: 0; height: 2px;
+  }
+  .stat-card.s-blue::before   { background: linear-gradient(90deg,#0ea5e9,#6366f1); }
+  .stat-card.s-amber::before  { background: linear-gradient(90deg,#f59e0b,#ef4444); }
+  .stat-card.s-green::before  { background: linear-gradient(90deg,#10b981,#06b6d4); }
+  .stat-card.s-red::before    { background: linear-gradient(90deg,#ef4444,#a855f7); }
+  .stat-icon {
+    width: 40px; height: 40px; border-radius: 12px;
+    display: flex; align-items: center; justify-content: center; font-size: 16px;
+  }
+  .s-blue  .stat-icon { background: rgba(14,165,233,0.12);  color: #38bdf8; }
+  .s-amber .stat-icon { background: rgba(245,158,11,0.12);  color: #fbbf24; }
+  .s-green .stat-icon { background: rgba(16,185,129,0.12);  color: #34d399; }
+  .s-red   .stat-icon { background: rgba(239,68,68,0.12);   color: #f87171; }
+  .stat-val  { font-family: 'Syne',sans-serif; font-size: 32px; font-weight: 800; line-height: 1; }
+  .stat-label { font-size: 12px; color: var(--text-2); font-weight: 500; }
+
+  /* ============ CARDS ============ */
+  .panel-card {
+    background: var(--bg-card); border: 1px solid var(--border);
+    border-radius: 20px; overflow: hidden; margin-bottom: 24px;
+  }
+  .card-header {
+    padding: 18px 24px; border-bottom: 1px solid var(--border2);
+    display: flex; align-items: center; justify-content: space-between;
+  }
+  .card-header h2 { font-size: 16px; font-weight: 700; display: flex; align-items: center; gap: 8px; }
+  .card-header h2 i { color: var(--accent); font-size: 14px; }
+  .card-count {
+    background: rgba(255,255,255,0.06); color: var(--text-2);
+    font-size: 12px; font-weight: 700; padding: 4px 10px; border-radius: 20px;
+  }
+
+  /* ============ ACTIVITY LIST ============ */
+  .activity-row {
+    display: flex; align-items: center; gap: 14px;
+    padding: 14px 24px; border-bottom: 1px solid var(--border2);
+    transition: background 0.2s;
+  }
+  .activity-row:last-child { border-bottom: none; }
+  .activity-row:hover { background: rgba(255,255,255,0.02); }
+  .activity-icon { width: 40px; height: 40px; border-radius: 10px; object-fit: cover; flex-shrink: 0; }
+  .activity-info { flex: 1; min-width: 0; }
+  .activity-name { font-size: 14px; font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .activity-meta { font-size: 12px; color: var(--text-2); margin-top: 2px; }
+
+  /* ============ STATUS BADGES ============ */
+  .status-badge {
+    padding: 4px 10px; border-radius: 20px; font-size: 11px; font-weight: 700;
+    letter-spacing: 0.3px; text-transform: capitalize; white-space: nowrap;
+  }
+  .status-pending  { background: rgba(245,158,11,0.15); color: #fbbf24; border: 1px solid rgba(245,158,11,0.25); }
+  .status-approved { background: rgba(16,185,129,0.15); color: #34d399; border: 1px solid rgba(16,185,129,0.25); }
+  .status-rejected { background: rgba(239,68,68,0.15);  color: #f87171; border: 1px solid rgba(239,68,68,0.25); }
+
+  /* ============ REVIEW CARDS ============ */
+  .review-card {
+    background: var(--bg-card2); border: 1px solid var(--border);
+    border-radius: 16px; padding: 20px; margin: 0 24px 16px;
+    animation: fadeUp 0.3s ease;
+  }
+  .review-card-header { display: flex; align-items: flex-start; gap: 14px; margin-bottom: 12px; flex-wrap: wrap; }
+  .review-icon { width: 56px; height: 56px; border-radius: 14px; object-fit: cover; flex-shrink: 0; }
+  .review-meta { flex: 1; min-width: 0; }
+  .review-meta h3 { font-size: 16px; font-weight: 700; margin-bottom: 6px; }
+  .review-meta p  { font-size: 12px; color: var(--text-2); margin-bottom: 3px; }
+  .review-meta p i { color: var(--text-3); }
+  .review-desc { font-size: 13px; color: var(--text-2); line-height: 1.6; margin-bottom: 12px; }
+  .review-ss-row { display: flex; gap: 8px; overflow-x: auto; margin-bottom: 12px; scrollbar-width: none; }
+  .review-ss-row::-webkit-scrollbar { display: none; }
+  .review-ss { height: 100px; border-radius: 8px; flex-shrink: 0; }
+  .apk-link {
+    display: inline-flex; align-items: center; font-size: 12px; color: var(--accent);
+    background: rgba(56,189,248,0.08); border: 1px solid rgba(56,189,248,0.2);
+    padding: 7px 14px; border-radius: 8px; text-decoration: none; margin-bottom: 16px;
+    transition: background 0.2s;
+  }
+  .apk-link:hover { background: rgba(56,189,248,0.15); }
+  .review-actions { display: flex; gap: 10px; flex-wrap: wrap; }
+  .btn-approve {
+    flex: 1; min-width: 100px; padding: 11px;
+    background: rgba(16,185,129,0.12); color: #10b981;
+    border: 1px solid rgba(16,185,129,0.3); border-radius: 10px;
+    font-family: 'Syne',sans-serif; font-size: 13px; font-weight: 700;
+    cursor: pointer; transition: background 0.2s;
+  }
+  .btn-approve:hover { background: rgba(16,185,129,0.22); }
+  .btn-reject {
+    flex: 1; min-width: 100px; padding: 11px;
+    background: rgba(239,68,68,0.1); color: #ef4444;
+    border: 1px solid rgba(239,68,68,0.25); border-radius: 10px;
+    font-family: 'Syne',sans-serif; font-size: 13px; font-weight: 700;
+    cursor: pointer; transition: background 0.2s;
+  }
+  .btn-reject:hover { background: rgba(239,68,68,0.2); }
+
+  /* ============ MANAGE TABLE ============ */
+  .manage-table-wrap { overflow-x: auto; }
+  .manage-table { width: 100%; border-collapse: collapse; }
+  .manage-table thead tr {
+    border-bottom: 1px solid var(--border);
+  }
+  .manage-table th {
+    padding: 12px 20px; text-align: left;
+    font-size: 11px; font-weight: 700; letter-spacing: 0.8px;
+    text-transform: uppercase; color: var(--text-3);
+  }
+  .table-row { border-bottom: 1px solid var(--border2); transition: background 0.2s; }
+  .table-row:last-child { border-bottom: none; }
+  .table-row:hover { background: rgba(255,255,255,0.02); }
+  .manage-table td { padding: 14px 20px; font-size: 14px; vertical-align: middle; }
+  .table-app-cell { display: flex; align-items: center; gap: 10px; }
+  .table-icon { width: 36px; height: 36px; border-radius: 9px; object-fit: cover; }
+  .table-app-name { font-weight: 600; }
+  .table-secondary { color: var(--text-2); }
+  .cat-chip {
+    background: rgba(99,102,241,0.12); color: #818cf8;
+    border: 1px solid rgba(99,102,241,0.2);
+    padding: 3px 10px; border-radius: 20px; font-size: 11px; font-weight: 600;
+  }
+  .btn-delete-sm {
+    padding: 7px 14px;
+    background: rgba(239,68,68,0.08); color: #ef4444;
+    border: 1px solid rgba(239,68,68,0.2); border-radius: 8px;
+    font-size: 12px; font-weight: 600; cursor: pointer;
+    transition: background 0.2s; white-space: nowrap;
+    font-family: 'Inter',sans-serif;
+  }
+  .btn-delete-sm:hover { background: rgba(239,68,68,0.18); }
+
+  /* ============ SECTION PADDING ============ */
+  .section-body { padding: 24px 0 8px; }
+  .section-body .review-card:first-child { margin-top: 0; }
+
+  /* ============ EMPTY ============ */
+  .empty-msg {
+    display: flex; flex-direction: column; align-items: center;
+    justify-content: center; gap: 12px; padding: 60px 20px;
+    color: var(--text-3); font-size: 14px;
+  }
+  .empty-msg i { font-size: 40px; }
+
+  /* ============ TOAST ============ */
+  #toast {
+    position: fixed; top: 20px; right: 20px; z-index: 9999;
+    opacity: 0; transform: translateX(20px);
+    transition: all 0.3s; pointer-events: none;
+    min-width: 200px; max-width: 320px;
+  }
+
+  /* ============ HIDE SM ============ */
+  @media(max-width:640px) { .hide-sm { display: none; } }
+
+  /* ============ GRID TWO ============ */
+  .grid-two { display: grid; grid-template-columns: 1fr; gap: 24px; }
+  @media(min-width:900px) { .grid-two { grid-template-columns: 1fr 1fr; } }
+
+  /* Dashboard header */
+  .dash-welcome { margin-bottom: 24px; }
+  .dash-welcome h1 { font-size: 26px; font-weight: 800; margin-bottom: 4px; }
+  .dash-welcome p { font-size: 14px; color: var(--text-2); }
+
+  /* Review empty padding */
+  #review-list { padding-top: 8px; }
+  #manage-list { padding: 0; }
+
+  /* Scrollbar */
+  ::-webkit-scrollbar { width: 6px; height: 6px; }
+  ::-webkit-scrollbar-track { background: transparent; }
+  ::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.1); border-radius: 4px; }
+</style>
+</head>
+<body>
+
+<!-- TOAST -->
+<div id="toast"></div>
+
+<!-- PAGE LOADING -->
+<div id="page-loading">
+  <div class="load-logo">AD Store</div>
+  <div class="spinner"></div>
+</div>
+
+<!-- ============================================================ -->
+<!-- PAGE: LOGIN -->
+<!-- ============================================================ -->
+<div id="page-login" class="hidden">
+  <div class="login-box">
+    <div class="login-brand">
+      <div class="login-brand-icon"><i class="fas fa-shield-halved"></i></div>
+      <div class="login-brand-text">
+        <h1>AD Store</h1>
+        <p>ADMIN CONTROL CENTER</p>
+      </div>
+    </div>
+    <div class="login-label">Email Address</div>
+    <input id="l-email" class="login-input" type="email" placeholder="admin@adstore.com" autocomplete="email"/>
+    <div class="login-label">Password</div>
+    <input id="l-pass" class="login-input" type="password" placeholder="••••••••" autocomplete="current-password"/>
+    <button id="login-btn" onclick="window.handleLogin()">
+      <i class="fas fa-sign-in-alt mr-2"></i>Sign In
+    </button>
+    <p style="font-size:12px;color:var(--text-3);text-align:center;margin-top:20px;">
+      <i class="fas fa-lock mr-1"></i>Admin access only. Unauthorized access is prohibited.
+    </p>
+  </div>
+</div>
+
+<!-- ============================================================ -->
+<!-- PAGE: ACCESS DENIED -->
+<!-- ============================================================ -->
+<div id="page-denied" class="hidden">
+  <div class="denied-box">
+    <div class="denied-icon"><i class="fas fa-ban"></i></div>
+    <h2>Access Denied</h2>
+    <p>You are logged in as</p>
+    <p class="denied-email" id="denied-email">—</p>
+    <p style="margin-top:8px">This account does not have admin privileges.</p>
+
+    <hr class="denied-divider"/>
+
+    <p class="denied-setup-label">First time? Setup admin access below ↓</p>
+    <button id="setup-admin-btn" onclick="window.setupAdmin()">
+      <i class="fas fa-user-shield mr-2"></i>Setup Admin Access
+    </button>
+    <br/>
+    <button class="denied-logout" onclick="window.doLogout()">
+      Sign out and use a different account
+    </button>
+  </div>
+</div>
+
+<!-- ============================================================ -->
+<!-- PAGE: ADMIN PANEL -->
+<!-- ============================================================ -->
+<div id="page-panel" class="hidden" style="display:none;min-height:100vh;position:relative;">
+
+  <!-- SIDEBAR OVERLAY -->
+  <div id="sidebar-overlay" onclick="window.toggleSidebar()"></div>
+
+  <!-- SIDEBAR -->
+  <aside id="sidebar">
+    <div class="sidebar-brand">
+      <div class="sidebar-brand-row">
+        <div class="sidebar-brand-icon"><i class="fas fa-shield-halved"></i></div>
+        <div>
+          <div class="sidebar-brand-name">AD Store</div>
+          <div class="sidebar-brand-sub">Admin Panel</div>
+        </div>
+      </div>
+    </div>
+
+    <nav class="sidebar-nav">
+      <div class="nav-section-label">Overview</div>
+      <div class="nav-item nav-active" id="nav-dashboard" onclick="window.switchSection('dashboard')">
+        <i class="fas fa-gauge-high"></i> Dashboard
+      </div>
+
+      <div class="nav-section-label" style="margin-top:8px">Moderation</div>
+      <div class="nav-item" id="nav-review" onclick="window.switchSection('review')">
+        <i class="fas fa-hourglass-half"></i> Review Queue
+        <span id="pending-badge" style="display:none">0</span>
+      </div>
+      <div class="nav-item" id="nav-manage" onclick="window.switchSection('manage')">
+        <i class="fas fa-boxes-stacked"></i> Manage Apps
+      </div>
+    </nav>
+
+    <div class="sidebar-user">
+      <div id="admin-avatar">AD</div>
+      <div class="sidebar-user-info">
+        <div id="admin-name">Admin</div>
+        <div id="admin-email">—</div>
+      </div>
+      <button class="logout-icon-btn" onclick="window.doLogout()" title="Logout">
+        <i class="fas fa-sign-out-alt"></i>
+      </button>
+    </div>
+  </aside>
+
+  <!-- MAIN WRAP -->
+  <div class="main-wrap" style="display:flex;flex-direction:column;">
+
+    <!-- TOPBAR -->
+    <div class="topbar">
+      <button id="topbar-menu-btn" onclick="window.toggleSidebar()">
+        <i class="fas fa-bars"></i>
+      </button>
+      <span class="topbar-title" id="topbar-title">Dashboard</span>
+      <div class="topbar-right">
+        <div class="topbar-badge hidden" id="topbar-pending-badge">
+          <i class="fas fa-circle-dot" style="font-size:8px"></i>
+          <span id="topbar-pending-count">0</span> Pending
+        </div>
+      </div>
+    </div>
+
+    <!-- CONTENT -->
+    <div class="content">
+
+      <!-- ===== SECTION: DASHBOARD ===== -->
+      <div id="section-dashboard">
+        <div class="dash-welcome">
+          <h1>Good day, Admin 👋</h1>
+          <p>Here's what's happening on the platform today.</p>
+        </div>
+
+        <div class="stats-grid">
+          <div class="stat-card s-blue">
+            <div class="stat-icon"><i class="fas fa-layer-group"></i></div>
+            <div>
+              <div class="stat-val" id="stat-total">0</div>
+              <div class="stat-label">Total Apps</div>
+            </div>
+          </div>
+          <div class="stat-card s-amber">
+            <div class="stat-icon"><i class="fas fa-hourglass-half"></i></div>
+            <div>
+              <div class="stat-val" id="stat-pending">0</div>
+              <div class="stat-label">Pending Review</div>
+            </div>
+          </div>
+          <div class="stat-card s-green">
+            <div class="stat-icon"><i class="fas fa-circle-check"></i></div>
+            <div>
+              <div class="stat-val" id="stat-approved">0</div>
+              <div class="stat-label">Approved Apps</div>
+            </div>
+          </div>
+          <div class="stat-card s-red">
+            <div class="stat-icon"><i class="fas fa-circle-xmark"></i></div>
+            <div>
+              <div class="stat-val" id="stat-rejected">0</div>
+              <div class="stat-label">Rejected Apps</div>
+            </div>
+          </div>
+        </div>
+
+        <div class="panel-card">
+          <div class="card-header">
+            <h2><i class="fas fa-clock-rotate-left"></i>Recent Activity</h2>
+            <span class="card-count" id="activity-count">0 apps</span>
+          </div>
+          <div id="recent-activity">
+            <div class="empty-msg"><i class="fas fa-inbox"></i><p>No apps yet</p></div>
+          </div>
+        </div>
+      </div>
+
+      <!-- ===== SECTION: REVIEW QUEUE ===== -->
+      <div id="section-review" class="hidden">
+        <div class="dash-welcome">
+          <h1>Review Queue</h1>
+          <p>Apps waiting for your approval before going live.</p>
+        </div>
+        <div class="panel-card">
+          <div class="card-header">
+            <h2><i class="fas fa-hourglass-half"></i>Pending Apps</h2>
+            <span class="card-count" id="review-count">0 apps</span>
+          </div>
+          <div id="review-list" style="padding:16px 0 8px;">
+            <div class="empty-msg"><i class="fas fa-check-circle" style="color:#10b981"></i><p>No pending apps</p></div>
+          </div>
+        </div>
+      </div>
+
+      <!-- ===== SECTION: MANAGE ===== -->
+      <div id="section-manage" class="hidden">
+        <div class="dash-welcome">
+          <h1>Manage Apps</h1>
+          <p>All live approved apps on the platform.</p>
+        </div>
+        <div class="panel-card">
+          <div class="card-header">
+            <h2><i class="fas fa-boxes-stacked"></i>Approved Apps</h2>
+            <span class="card-count" id="manage-count">0 apps</span>
+          </div>
+          <div id="manage-list">
+            <div class="empty-msg"><i class="fas fa-box-open"></i><p>No approved apps yet</p></div>
+          </div>
+        </div>
+      </div>
+
+    </div><!-- /content -->
+  </div><!-- /main-wrap -->
+</div><!-- /page-panel -->
+
+<script>
+  // ── Topbar title sync (runs after module exposes window.switchSection) ──
+  window.addEventListener('load', function() {
+    const titles = { dashboard:'Dashboard', review:'Review Queue', manage:'Manage Apps' };
+    const _origSwitch = window.switchSection;
+    if (_origSwitch) {
+      window.switchSection = function(sec) {
+        _origSwitch(sec);
+        const el = document.getElementById('topbar-title');
+        if (el) el.textContent = titles[sec] || 'Admin';
+      };
+    }
+    // Pending badge sync
+    new MutationObserver(function() {
+      const val = parseInt(document.getElementById('stat-pending')?.textContent || '0');
+      const badge = document.getElementById('topbar-pending-badge');
+      const cnt   = document.getElementById('topbar-pending-count');
+      if (badge) badge.classList.toggle('hidden', val === 0);
+      if (cnt)   cnt.textContent = val;
+      const total    = parseInt(document.getElementById('stat-total')?.textContent||'0');
+      const approved = parseInt(document.getElementById('stat-approved')?.textContent||'0');
+      const al = document.getElementById('activity-count');
+      const rl = document.getElementById('review-count');
+      const ml = document.getElementById('manage-count');
+      if(al) al.textContent = total + ' apps';
+      if(rl) rl.textContent = val + ' apps';
+      if(ml) ml.textContent = approved + ' apps';
+    }).observe(document.body, { subtree:true, childList:true, characterData:true });
+  });
+</script>
+</body>
+</html>
